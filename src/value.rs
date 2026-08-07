@@ -2500,6 +2500,34 @@ mod tests {
     }
 
     #[test]
+    fn wide_bitwise_zero_extends_narrower_operand() {
+        // wide(66) | wide(160): beyond bit 66, self reads 0 → OR(0, x).
+        // The byte-wise path must reproduce per-bit OR semantics exactly.
+        let narrow = Value::from_str_radix(&"1x0z".repeat(17), 2, 66);
+        let wide = Value::from_str_radix(&"f0".repeat(20), 16, 160);
+        let got = narrow.bitwise_or(&wide);
+        for i in 0..160usize {
+            let want = match (narrow.get_bit(i), wide.get_bit(i)) {
+                (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+                (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+                _ => LogicBit::X,
+            };
+            assert_eq!(got.get_bit(i), want, "bit {i}");
+        }
+        // AND: zero-extended side forces 0 above its width.
+        let got = narrow.bitwise_and(&wide);
+        for i in 0..160usize {
+            let want = if i < 66 {
+                match (narrow.get_bit(i), wide.get_bit(i)) {
+                    (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+                    (LogicBit::One, LogicBit::One) => LogicBit::One,
+                    _ => LogicBit::X,
+                }
+            } else { LogicBit::Zero };
+            assert_eq!(got.get_bit(i), want, "and bit {i}");
+        }
+    }
+    #[test]
     fn wide_reductions_match_reference() {
         // reduce_and: known 0 wins over X/Z. reduce_or: known 1 wins over X/Z.
         let all_x = Value::new(160);
