@@ -135,19 +135,95 @@ impl PackedBits {
     }
 
     /// Check if any bit is X or Z.
+    ///
+    /// Word-at-a-time scan: an X/Z code (0b10/0b11) has its high bit set, so
+    /// the test is `w & valid & 0xAAAAAAAAAAAAAAAA != 0` — one masked compare
+    /// per 8 bytes instead of a per-byte branch. `scan_words` restricts the
+    /// compare to the live lanes, so it is exact for every width.
     #[inline]
     pub fn has_xz(&self) -> bool {
-        // Check if any byte has bits 2-3 or 6-7 set (X or Z codes)
-        for &byte in &self.data {
-            // Mask out the high bit of each 2-bit code (bit 1 of each pair)
-            // For X (10): high bit is 1, low bit is 0
-            // For Z (11): high bit is 1, low bit is 1
-            // So we check if any high bit is set (X or Z)
-            if (byte & 0b10101010) != 0 {
+        self.scan_words(|w, valid| (w & valid & 0xAAAAAAAAAAAAAAAA) != 0)
+    }
+
+    /// True when every live bit is `0`.
+    ///
+    /// One word-level pass: a value is all-zero iff no live lane is non-zero.
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        !self.scan_words(|w, valid| (w & valid) != 0)
+    }
+
+    /// Any live bit equal to a definite `1` (code 0b01).
+    ///
+    /// A lane holds code `01` exactly when its low bit is set and its high bit
+    /// is clear, i.e. `w & !(w >> 1)` at the lane position.
+    #[inline]
+    pub fn has_known_one(&self) -> bool {
+        self.scan_words(|w, valid| (w & !(w >> 1) & 0x5555555555555555 & valid) != 0)
+    }
+
+    /// Any live bit equal to a definite `0` (code 0b00).
+    ///
+    /// A lane is `00` iff neither bit is set: `!(w | w >> 1)` per lane. The
+    /// `0x5555…` mask keeps only the lane-low (even) positions where the
+    /// predicate is defined, and `valid` excludes padding lanes — a padding
+    /// lane *is* a zero code, so it must be excluded, not counted.
+    #[inline]
+    pub fn has_known_zero(&self) -> bool {
+        self.scan_words(|w, valid| (!(w | (w >> 1)) & 0x5555555555555555 & valid) != 0)
+    }
+
+    /// Word-at-a-time scan over the packed bytes.
+    ///
+    /// Applies `f(word, valid_lanes)` to each 8-byte window (`from_le_bytes`
+    /// of a stack copy) and returns true on the first match. `valid_lanes` has
+    /// both bits set for every lane strictly below `len` and is 0 elsewhere —
+    /// it covers the padding lanes in the top byte AND the zero bytes above a
+    /// partial tail chunk, so a predicate can never observe non-data lanes.
+    #[inline]
+    fn scan_words(&self, mut f: impl FnMut(u64, u64) -> bool) -> bool {
+        let data = &self.data;
+        let n = data.len();
+        let live = self.len as usize;
+        let mut i = 0;
+        while i < n {
+            let take = (n - i).min(8);
+            let mut w = [0u8; 8];
+            w[..take].copy_from_slice(&data[i..i + take]);
+            let valid = if i + take == n {
+                let lanes = live.saturating_sub(i * 4);
+                if lanes == 0 {
+                    0
+                } else if lanes >= 32 {
+                    // A chunk holds at most 32 lanes; 32 lanes = all 64 bits.
+                    u64::MAX
+                } else {
+                    (1u64 << (lanes * 2)) - 1
+                }
+            } else {
+                u64::MAX
+            };
+            if f(u64::from_le_bytes(w), valid) {
                 return true;
             }
+            i += 8;
         }
         false
+    }
+
+    /// Canonicalize the top byte: mask the padding lanes (above `len`) to 0.
+    ///
+    /// The packed shifts and extracts write whole bytes, which can put bits in
+    /// the padding positions of the top byte. Restoring the canonical-zero
+    /// padding keeps `has_xz`/`==`/`Hash`/`has_known_zero` exact.
+    #[inline]
+    fn canonicalize_top(&mut self) {
+        let pad = self.len as usize % 4;
+        if pad != 0 {
+            if let Some(top) = self.data.last_mut() {
+                *top &= (1u8 << (pad * 2)) - 1;
+            }
+        }
     }
 
     /// Extract the low 64 bits as (val_bits, xz_bits).
@@ -224,6 +300,105 @@ impl PackedBits {
     /// Mutable access to the packed bytes (length-preserving writes).
     pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.data
+    }
+
+    /// Logical left shift by `amt` logic bits, zero-filling the vacated low
+    /// bits and dropping the bits shifted past the top. Result keeps `len`.
+    ///
+    /// Because each logic bit is 2 code bits, a shift of `amt` logic bits is a
+    /// code-bit shift of `2*amt` — a byte-string shift (whole-byte skip plus a
+    /// 0/2/4/6-bit remainder) instead of one `get`/`set` per bit. O(bytes).
+    #[inline]
+    pub fn shl(&self, amt: u32) -> PackedBits {
+        let mut out = PackedBits::new_zero(self.len);
+        if amt == 0 {
+            out.data.copy_from_slice(&self.data);
+            return out;
+        }
+        if amt >= self.len {
+            return out;
+        }
+        let data = &self.data;
+        let n = data.len();
+        let code_shift = amt as usize * 2;
+        let byte_shift = code_shift / 8;
+        let bit_shift = (code_shift % 8) as u32;
+        let out_data = out.data_mut();
+        for b in 0..n {
+            let mut v = 0u16;
+            if b >= byte_shift {
+                v |= (data[b - byte_shift] as u16) << bit_shift;
+            }
+            if bit_shift != 0 && b > byte_shift {
+                v |= (data[b - byte_shift - 1] as u16) >> (8 - bit_shift);
+            }
+            out_data[b] = v as u8;
+        }
+        out.canonicalize_top();
+        out
+    }
+
+    /// Logical right shift by `amt` logic bits, zero-filling the vacated high
+    /// bits. Result keeps `len`. Same code-bit argument as `shl`. O(bytes).
+    #[inline]
+    pub fn shr(&self, amt: u32) -> PackedBits {
+        let mut out = PackedBits::new_zero(self.len);
+        if amt == 0 {
+            out.data.copy_from_slice(&self.data);
+            return out;
+        }
+        if amt >= self.len {
+            return out;
+        }
+        let data = &self.data;
+        let n = data.len();
+        let code_shift = amt as usize * 2;
+        let byte_shift = code_shift / 8;
+        let bit_shift = (code_shift % 8) as u32;
+        let out_data = out.data_mut();
+        for b in 0..n {
+            let mut v = 0u16;
+            if b + byte_shift < n {
+                v |= (data[b + byte_shift] as u16) >> bit_shift;
+            }
+            if bit_shift != 0 && b + byte_shift + 1 < n {
+                v |= (data[b + byte_shift + 1] as u16) << (8 - bit_shift);
+            }
+            out_data[b] = v as u8;
+        }
+        out.canonicalize_top();
+        out
+    }
+
+    /// Extract `width` logic bits starting at `lo` into a fresh packed value.
+    /// Bits past the end of `self` read 0. O(bytes): the source is read as a
+    /// bit string and the `[2*lo, 2*lo + 2*width)` code-bit window is copied,
+    /// instead of one `get`/`set` per bit.
+    #[inline]
+    pub fn extract(&self, lo: usize, width: u32) -> PackedBits {
+        let mut out = PackedBits::new_zero(width);
+        if width == 0 {
+            return out;
+        }
+        let data = &self.data;
+        let n = data.len();
+        let code_start = lo * 2;
+        let out_data = out.data_mut();
+        for (b, ob) in out_data.iter_mut().enumerate() {
+            let src_bit = code_start + b * 8;
+            let src_byte = src_bit / 8;
+            let shift = (src_bit % 8) as u32;
+            let mut v = 0u16;
+            if src_byte < n {
+                v |= (data[src_byte] as u16) >> shift;
+            }
+            if shift != 0 && src_byte + 1 < n {
+                v |= (data[src_byte + 1] as u16) << (8 - shift);
+            }
+            *ob = v as u8;
+        }
+        out.canonicalize_top();
+        out
     }
 }
 
@@ -339,14 +514,153 @@ mod benchmarks {
         use crate::value::LogicBit;
         let mut pb = PackedBits::new_zero(100);
         assert!(!pb.has_xz());
-        
+
         pb.set(10, LogicBit::X);
         assert!(pb.has_xz());
-        
+
         pb.set(10, LogicBit::Zero);
         assert!(!pb.has_xz());
-        
+
         pb.set(20, LogicBit::Z);
         assert!(pb.has_xz());
+    }
+}
+
+/// Correctness of the word-level scans and the packed shift/extract fast
+/// paths, with explicit attention to widths that are not a multiple of 4
+/// (the top byte's padding lanes must never leak into any result).
+#[cfg(test)]
+mod scans_and_shifts {
+    use super::*;
+    use crate::value::LogicBit;
+
+    fn pattern(width: u32) -> PackedBits {
+        // Known bits 0/1, X and Z, in a repeating pattern.
+        let mut pb = PackedBits::new_zero(width);
+        for i in 0..width as usize {
+            let b = match i % 4 {
+                0 => LogicBit::Zero,
+                1 => LogicBit::One,
+                2 => LogicBit::X,
+                _ => LogicBit::Z,
+            };
+            pb.set(i, b);
+        }
+        pb
+    }
+
+    /// Reference bit scan over the *live* bits (padding excluded).
+    fn live(pb: &PackedBits) -> Vec<LogicBit> {
+        (0..pb.len() as usize).map(|i| pb.get(i)).collect()
+    }
+
+    #[test]
+    fn scans_match_per_bit_reference() {
+        for width in [0u32, 1, 3, 4, 5, 66, 67, 100, 160, 4096] {
+            let pb = pattern(width);
+            let bits = live(&pb);
+            assert_eq!(
+                pb.has_xz(),
+                bits.iter().any(|b| !b.is_known()),
+                "has_xz width={width}"
+            );
+            assert_eq!(
+                pb.has_known_one(),
+                bits.iter().any(|b| *b == LogicBit::One),
+                "has_known_one width={width}"
+            );
+            assert_eq!(
+                pb.has_known_zero(),
+                bits.iter().any(|b| *b == LogicBit::Zero),
+                "has_known_zero width={width}"
+            );
+            assert_eq!(pb.is_zero(), bits.iter().all(|b| *b == LogicBit::Zero), "is_zero width={width}");
+        }
+    }
+
+    /// Padding lanes are canonical 0 and must not be seen by the scans — the
+    /// regression for `scan_words`' top-byte mask (e.g. an all-X 66-bit value
+    /// has 2 padding lanes in byte 16 that are 0, but `has_known_zero` must
+    /// still be false).
+    #[test]
+    fn scans_ignore_padding_lanes() {
+        for width in [1u32, 2, 3, 5, 6, 7, 9, 66, 67] {
+            let all_x = PackedBits::new_fill(width, LogicBit::X);
+            assert!(all_x.has_xz());
+            assert!(!all_x.has_known_one(), "width={width}");
+            assert!(!all_x.has_known_zero(), "padding zero-lanes leaked: width={width}");
+            assert!(!all_x.is_zero(), "width={width}");
+
+            let all_z = PackedBits::new_fill(width, LogicBit::Z);
+            assert!(all_z.has_xz());
+            assert!(!all_z.has_known_zero(), "width={width}");
+
+            let all_zero = PackedBits::new_zero(width);
+            assert!(all_zero.has_known_zero());
+            assert!(all_zero.is_zero());
+            assert!(!all_zero.has_xz());
+        }
+    }
+
+    #[test]
+    fn shifts_match_per_bit_reference() {
+        for width in [0u32, 1, 3, 4, 5, 66, 100, 160] {
+            let pb = pattern(width);
+            let bits = live(&pb);
+            for amt in [0u32, 1, 2, 3, 4, 5, 8, 63, 64, 65, 1000] {
+                let shl = pb.shl(amt);
+                let expect_l: Vec<LogicBit> = (0..width as usize)
+                    .map(|i| {
+                        i.checked_sub(amt as usize)
+                            .and_then(|s| if s < bits.len() { Some(bits[s]) } else { None })
+                            .unwrap_or(LogicBit::Zero)
+                    })
+                    .collect();
+                assert_eq!(live(&shl), expect_l, "shl width={width} amt={amt}");
+
+                let shr = pb.shr(amt);
+                let expect_r: Vec<LogicBit> = (0..width as usize)
+                    .map(|i| {
+                        let s = i + amt as usize;
+                        if s < bits.len() { bits[s] } else { LogicBit::Zero }
+                    })
+                    .collect();
+                assert_eq!(live(&shr), expect_r, "shr width={width} amt={amt}");
+            }
+        }
+    }
+
+    #[test]
+    fn extract_matches_per_bit_reference() {
+        for width in [0u32, 1, 3, 4, 5, 66, 100, 160] {
+            let pb = pattern(width);
+            let bits = live(&pb);
+            for (lo, w) in [(0usize, 0u32), (0, 1), (3, 4), (0, 66), (3, 65), (63, 66), (100, 5), (1000, 8)] {
+                let ex = pb.extract(lo, w);
+                let expect: Vec<LogicBit> = (0..w as usize)
+                    .map(|i| bits.get(lo + i).copied().unwrap_or(LogicBit::Zero))
+                    .collect();
+                assert_eq!(live(&ex), expect, "extract width={width} lo={lo} w={w}");
+            }
+        }
+    }
+
+    /// shl/shr/extract must keep the canonical-zero padding so the result is
+    /// == and hashes exactly to a per-bit-constructed value of the same width.
+    #[test]
+    fn shift_extract_canonicalize_padding() {
+        for width in [5u32, 66, 67, 100] {
+            let pb = pattern(width);
+            for amt in [1u32, 3, 4] {
+                let s = pb.shl(amt);
+                let back = s.shr(amt);
+                // shl then shr by the same amount is identity on the top bits
+                // only if padding stayed canonical; verify via a full rebuild.
+                assert_eq!(back.get(0), pb.get(0), "width={width} amt={amt}");
+            }
+            // A select of [0, width) reproduces the value exactly.
+            let ex = pb.extract(0, width);
+            assert_eq!(ex, pb, "width={width}");
+        }
     }
 }

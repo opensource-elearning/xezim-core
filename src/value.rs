@@ -140,6 +140,18 @@ impl PartialEq for ValueStorage {
 }
 
 /// An arbitrary-width 4-state logic value.
+/// Apply a packed byte op through a 4×4 truth table over the 2-bit codes,
+/// producing one result byte (4 logic bits) per call. The table is built from
+/// the exact per-bit closure the op used, so results are bit-identical; this
+/// just avoids the div/mod + dispatch of one `get_bit`/`set_bit` per bit.
+#[inline]
+fn byte_op4(a: u8, b: u8, t: &[[u8; 4]; 4]) -> u8 {
+    t[(a & 0b11) as usize][(b & 0b11) as usize]
+        | t[((a >> 2) & 0b11) as usize][((b >> 2) & 0b11) as usize] << 2
+        | t[((a >> 4) & 0b11) as usize][((b >> 4) & 0b11) as usize] << 4
+        | t[((a >> 6) & 0b11) as usize][((b >> 6) & 0b11) as usize] << 6
+}
+
 #[derive(Debug, Clone, Eq, Hash, Serialize, Deserialize)]
 pub struct Value {
     storage: ValueStorage,
@@ -603,20 +615,15 @@ impl Value {
                 true
             }
             ValueStorage::Wide(bits) => {
+                // PackedBits::set does the bounds check and read-modify-write
+                // in one pass and reports whether the bit changed.
                 let bit = match code {
                     0 => LogicBit::Zero,
                     1 => LogicBit::One,
                     2 => LogicBit::X,
                     _ => LogicBit::Z,
                 };
-                if i >= bits.len() as usize {
-                    return false;
-                }
-                if bits.get(i) == bit {
-                    return false;
-                }
-                bits.set(i, bit);
-                true
+                bits.set(i, bit)
             }
         }
     }
@@ -1243,14 +1250,63 @@ impl Value {
     }
 
     fn bitwise_op_slow(&self, other: &Value, op: impl Fn(LogicBit, LogicBit) -> LogicBit) -> Value {
-        let w = self.width.max(other.width) as usize;
-        let mut result = Value::zero(w as u32);
-        for i in 0..w {
-            let a = self.get_bit(i);
-            let b = other.get_bit(i);
-            result.set_bit(i, op(a, b));
+        // Byte-wise wide path: build the 4×4 truth table over the 2-bit codes
+        // ONCE from the exact closure the per-bit fallback used, then apply it
+        // to one packed byte pair at a time (4 logic bits per byte). This is
+        // bit-identical to the old per-bit loop by construction, but skips the
+        // div/mod of every `get_bit`/`set_bit` and the per-iteration dispatch.
+        let mut t = [[0u8; 4]; 4];
+        for a in 0..4u8 {
+            for b in 0..4u8 {
+                t[a as usize][b as usize] =
+                    op(LogicBit::from_code(a), LogicBit::from_code(b)).to_code();
+            }
+        }
+        let mut sa = [0u8; 16];
+        let mut sb = [0u8; 16];
+        let a = self.packed_bytes(&mut sa);
+        let b = other.packed_bytes(&mut sb);
+        let w = self.width.max(other.width);
+        let mut result = Value::zero(w);
+        if let ValueStorage::Wide(rb) = &mut result.storage {
+            let rdata = rb.data_mut();
+            for i in 0..rdata.len() {
+                let av = if i < a.len() { a[i] } else { 0 };
+                let bv = if i < b.len() { b[i] } else { 0 };
+                rdata[i] = byte_op4(av, bv, &t);
+            }
         }
         result
+    }
+
+    /// Packed bytes of an operand for the byte-wise wide ops, zero-extended to
+    /// the result's byte count. A `Wide` operand hands back its data directly;
+    /// an `Inline` operand (≤64 bits, so at most 16 bytes) is packed from its
+    /// two words into the scratch buffer. Bits past the operand's width read 0
+    /// — the same rule `get_bit` applies, so mixed-width operands stay exact.
+    fn packed_bytes<'a>(&'a self, scratch: &'a mut [u8; 16]) -> &'a [u8] {
+        match &self.storage {
+            ValueStorage::Wide(pb) => pb.data(),
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let width = self.width.min(64) as usize;
+                let nb = (width + 3) / 4;
+                for b in 0..nb {
+                    let base = b * 4;
+                    let mut byte = 0u8;
+                    for j in 0..4 {
+                        let i = base + j;
+                        if i >= width {
+                            break;
+                        }
+                        let v = ((*val_bits >> i) & 1) as u8;
+                        let x = ((*xz_bits >> i) & 1) as u8;
+                        byte |= (v | (x << 1)) << (j * 2);
+                    }
+                    scratch[b] = byte;
+                }
+                &scratch[..nb]
+            }
+        }
     }
 
     /// Per-bit merge following IEEE 1800 §11.4.11 Table 11-21: a bit is known
@@ -1313,15 +1369,16 @@ impl Value {
                     width: self.width, is_signed: self.is_signed, is_real: false, is_fill: false,
                 }
             }
-            _ => {
-                let mut result = Value::zero(self.width);
-                for i in 0..self.width as usize {
-                    let src = (i as u32).checked_sub(amt);
-                    if let Some(s) = src {
-                        result.set_bit(i, self.get_bit(s as usize));
-                    }
+            ValueStorage::Wide(bits) => {
+                // Packed byte-string shift: O(bytes) instead of one
+                // get_bit/set_bit per bit (see PackedBits::shl).
+                Value {
+                    storage: ValueStorage::Wide(Box::new(bits.shl(amt))),
+                    width: self.width,
+                    is_signed: false, // shift results are unsigned (matches the old Value::zero path)
+                    is_real: false,
+                    is_fill: false,
                 }
-                result
             }
         }
     }
@@ -1341,15 +1398,16 @@ impl Value {
                     width: self.width, is_signed: self.is_signed, is_real: false, is_fill: false,
                 }
             }
-            _ => {
-                let mut result = Value::zero(self.width);
-                for i in 0..self.width as usize {
-                    let src = i + amt as usize;
-                    if src < self.width as usize {
-                        result.set_bit(i, self.get_bit(src));
-                    }
+            ValueStorage::Wide(bits) => {
+                // Packed byte-string shift: O(bytes) instead of one
+                // get_bit/set_bit per bit (see PackedBits::shr).
+                Value {
+                    storage: ValueStorage::Wide(Box::new(bits.shr(amt))),
+                    width: self.width,
+                    is_signed: false, // shift results are unsigned (matches the old Value::zero path)
+                    is_real: false,
+                    is_fill: false,
                 }
-                result
             }
         }
     }
@@ -1728,7 +1786,9 @@ impl Value {
                 else { Some(false) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| b == LogicBit::One) { Some(true) }
+                // Word-level scans with early exit (PackedBits::has_known_one /
+                // has_xz) instead of two per-bit iterator passes.
+                if bits.has_known_one() { Some(true) }
                 else if bits.has_xz() { None }
                 else { Some(false) }
             }
@@ -1752,8 +1812,8 @@ impl Value {
                 else { Value::from_u64(1, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| b == LogicBit::Zero) { Value::from_u64(0, 1) }
-                else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
+                if bits.has_known_zero() { Value::from_u64(0, 1) }
+                else if bits.has_xz() { Value::new(1) }
                 else { Value::from_u64(1, 1) }
             }
         }
@@ -1769,8 +1829,8 @@ impl Value {
                 else { Value::from_u64(0, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| b == LogicBit::One) { Value::from_u64(1, 1) }
-                else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
+                if bits.has_known_one() { Value::from_u64(1, 1) }
+                else if bits.has_xz() { Value::new(1) }
                 else { Value::from_u64(0, 1) }
             }
         }
@@ -2266,6 +2326,7 @@ mod tests {
 
     // Exercise every rewritten Wide arm against a known 160-bit pattern, so a
     // packing bug cannot hide behind another packed path.
+
     #[test]
     fn wide_ops_are_bit_accurate() {
         let a = Value::from_str_radix(&"f0".repeat(20), 16, 160); // 0xF0F0…F0
@@ -2305,6 +2366,154 @@ mod tests {
         assert!(!ts.has_xz());
         assert_eq!(ts.range_select(15, 12).to_u64(), Some(0xF));
         assert_eq!(ts.range_select(11, 8).to_u64(), Some(0x0));
+    }
+
+    // Tier1 differential coverage: the packed shift / bitwise / range_select /
+    // reduction fast paths must agree bit-for-bit with the per-bit reference
+    // for X/Z patterns and widths that are not a multiple of 4.
+    #[test]
+    fn wide_shifts_match_per_bit_reference() {
+        let patterns = [
+            Value::from_str_radix(&"f0".repeat(20), 16, 160),
+            Value::from_str_radix(&"x0z1".repeat(20), 16, 160),
+            Value::from_str_radix(&"1x0z".repeat(17), 2, 66),
+            Value::ones(66),
+            Value::new(66),
+        ];
+        for v in &patterns {
+            for amt in [0u32, 1, 3, 4, 5, 8, 63, 64, 65] {
+                let mut ref_l = Value::zero(v.width);
+                for i in 0..v.width as usize {
+                    if let Some(s) = (i as u32).checked_sub(amt) {
+                        ref_l.set_bit(i, v.get_bit(s as usize));
+                    }
+                }
+                let got = v.shift_left(&Value::from_u64(amt as u64, 32));
+                assert_eq!(got, ref_l, "shl width={} amt={}", v.width, amt);
+                assert!(!got.has_xz() || v.has_xz(), "shl must not invent X/Z");
+
+                let mut ref_r = Value::zero(v.width);
+                for i in 0..v.width as usize {
+                    let s = i + amt as usize;
+                    if s < v.width as usize {
+                        ref_r.set_bit(i, v.get_bit(s));
+                    }
+                }
+                let got = v.shift_right(&Value::from_u64(amt as u64, 32));
+                assert_eq!(got, ref_r, "shr width={} amt={}", v.width, amt);
+            }
+        }
+    }
+
+    /// The pre-packed per-bit implementation of `bitwise_op_slow`: one
+    /// get_bit/set_bit per bit through the operand's truth-table closure.
+    /// Used as the reference the byte-wise wide path must match exactly.
+    fn per_bit_op(a: &Value, b: &Value, op: impl Fn(LogicBit, LogicBit) -> LogicBit) -> Value {
+        let w = a.width.max(b.width);
+        let mut r = Value::zero(w);
+        for i in 0..w as usize {
+            r.set_bit(i, op(a.get_bit(i), b.get_bit(i)));
+        }
+        r
+    }
+
+    // AND/OR/XOR closures — copied verbatim from bitwise_and/or/xor so the
+    // reference and production tables are guaranteed identical.
+    fn and_op(x: LogicBit, y: LogicBit) -> LogicBit {
+        match (x, y) {
+            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+            (LogicBit::One, LogicBit::One) => LogicBit::One,
+            _ => LogicBit::X,
+        }
+    }
+    fn or_op(x: LogicBit, y: LogicBit) -> LogicBit {
+        match (x, y) {
+            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+            _ => LogicBit::X,
+        }
+    }
+    fn xor_op(x: LogicBit, y: LogicBit) -> LogicBit {
+        match (x, y) {
+            (LogicBit::Zero, LogicBit::Zero) | (LogicBit::One, LogicBit::One) => LogicBit::Zero,
+            (LogicBit::Zero, LogicBit::One) | (LogicBit::One, LogicBit::Zero) => LogicBit::One,
+            _ => LogicBit::X,
+        }
+    }
+
+    #[test]
+    fn wide_bitwise_mixed_widths_match_reference() {
+        // Wide AND/OR/XOR an inline operand (and a narrower wide) must match a
+        // per-bit reference with the narrower side zero-extended.
+        let wide = Value::from_str_radix(&"f0xz".repeat(20), 16, 160);
+        let small = Value::from_u64(0x5A, 8);
+        let narrow = Value::from_str_radix(&"xz10".repeat(17), 2, 66);
+        for (a, b) in [(&wide, &small), (&wide, &narrow), (&narrow, &small), (&narrow, &wide)] {
+            for (name, f, op) in [
+                ("and", Value::bitwise_and as fn(&Value, &Value) -> Value, and_op as fn(LogicBit, LogicBit) -> LogicBit),
+                ("or", Value::bitwise_or as fn(&Value, &Value) -> Value, or_op as fn(LogicBit, LogicBit) -> LogicBit),
+                ("xor", Value::bitwise_xor as fn(&Value, &Value) -> Value, xor_op as fn(LogicBit, LogicBit) -> LogicBit),
+            ] {
+                assert_eq!(f(a, b), per_bit_op(a, b, op), "{name} width {} vs {}", a.width, b.width);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_range_select_matches_per_bit_reference() {
+        let patterns = [
+            Value::from_str_radix(&"x0z1".repeat(20), 16, 160),
+            Value::from_str_radix(&"1x0z".repeat(17), 2, 66),
+        ];
+        for v in &patterns {
+            let wsrc = v.width as usize;
+            // Fully in-range selects exercise the packed extract path directly
+            // and must match a per-bit reference bit-for-bit.
+            for (lo, hi) in [
+                (0usize, 65usize),
+                (3, 70),
+                (4, 100),
+                (7, 66),
+                (2, 2),
+                (63, 128),
+            ] {
+                let w = hi - lo + 1;
+                if lo + w > wsrc {
+                    continue; // overhang → handled below with the §11.5.1 x rule
+                }
+                let mut ref_v = Value::zero(w as u32);
+                for i in 0..w {
+                    ref_v.set_bit(i, v.get_bit(lo + i));
+                }
+                assert_eq!(v.range_select(hi, lo), ref_v, "range lo={} hi={} width={}", lo, hi, v.width);
+            }
+            // Partial overhang: bits past the source read x (§11.5.1).
+            let (lo, hi) = (60usize, 70usize);
+            if lo + hi - lo + 1 > wsrc {
+                let got = v.range_select(hi, lo);
+                for i in 0..(hi - lo + 1) {
+                    let want = if lo + i < wsrc { v.get_bit(lo + i) } else { LogicBit::X };
+                    assert_eq!(got.get_bit(i), want, "overhang lo={lo} hi={hi} bit {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_reductions_match_reference() {
+        // reduce_and: known 0 wins over X/Z. reduce_or: known 1 wins over X/Z.
+        let all_x = Value::new(160);
+        let with_zero = Value::from_str_radix(&"0".repeat(40), 16, 160);
+        let with_one = Value::from_str_radix(&"1".repeat(40), 16, 160);
+        assert_eq!(all_x.reduce_and(), Value::new(1), "all-X and → x");
+        assert_eq!(all_x.reduce_or(), Value::new(1), "all-X or → x");
+        assert_eq!(with_zero.reduce_and(), Value::from_u64(0, 1));
+        assert_eq!(with_one.reduce_or(), Value::from_u64(1, 1));
+        assert_eq!(Value::ones(160).reduce_and(), Value::from_u64(1, 1));
+        assert_eq!(Value::zero(160).reduce_or(), Value::from_u64(0, 1));
+        assert_eq!(with_zero.is_nonzero(), Some(false));
+        assert_eq!(with_one.is_nonzero(), Some(true));
+        assert_eq!(all_x.is_nonzero(), None);
     }
 
     // Padding bits above `width` in the last packed byte (widths not a
@@ -3036,18 +3245,15 @@ impl Value {
         // Inline→Inline fast path landed (set_bit fan-out was ~40% of
         // range_select self-time on its own).
         if let ValueStorage::Wide(bits) = &self.storage {
-            // Wide → Wide: copy the selected bits into a fresh packed value.
-            // (The packed 2-bit encoding no longer gives a byte-aligned memcpy
-            // for arbitrary `lo`; the per-bit copy below is correct and still
-            // O(width). A packed-shift fast path can follow if profiling ever
-            // shows this hot for wide signals.)
+            // Wide → Wide: copy the selected bits into a fresh packed value
+            // with a packed window copy (PackedBits::extract) — O(bytes), not
+            // one get/set per bit. The top byte's padding is canonicalized by
+            // extract, so the result compares/hashes exactly for any width.
             if width > 64 {
-                let mut out = PackedBits::new_zero(width as u32);
-                let len = bits.len() as usize;
-                let copy_len = width.min(len.saturating_sub(lo));
-                for i in 0..copy_len {
-                    out.set(i, bits.get(lo + i));
-                }
+                // Packed window copy: reads the source as a bit string and
+                // shifts out the `[lo, lo+width)` window in O(bytes) instead
+                // of one get/set per bit (PackedBits::extract).
+                let out = bits.extract(lo, width as u32);
                 return Value {
                     storage: ValueStorage::Wide(Box::new(out)),
                     width: width as u32,
