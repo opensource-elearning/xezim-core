@@ -6,8 +6,8 @@
 //! 2-bit `PackedBits` representation (4 logic bits per byte, ~4× less memory
 //! than a `Vec<LogicBit>`), boxed so the storage enum stays 24 bytes.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use serde::{Serialize, Deserialize};
 
 use crate::packed_value::PackedBits;
 
@@ -118,7 +118,6 @@ mod wide_serde {
         Ok(Box::new(PackedBits::from_bits(bits)))
     }
 }
-
 
 impl PartialEq for ValueStorage {
     /// Same result as the previous `#[derive(PartialEq)]` (Inline compares its
@@ -610,8 +609,12 @@ impl Value {
                     2 => LogicBit::X,
                     _ => LogicBit::Z,
                 };
-                if i >= bits.len() as usize { return false; }
-                if bits.get(i) == bit { return false; }
+                if i >= bits.len() as usize {
+                    return false;
+                }
+                if bits.get(i) == bit {
+                    return false;
+                }
                 bits.set(i, bit);
                 true
             }
@@ -1228,7 +1231,13 @@ impl Value {
                     LogicBit::One => LogicBit::Zero,
                     _ => LogicBit::X,
                 });
-                Value { storage: ValueStorage::Wide(nb), width: self.width, is_signed: self.is_signed , is_real: false, is_fill: false }
+                Value {
+                    storage: ValueStorage::Wide(nb),
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: false,
+                }
             }
         }
     }
@@ -2210,7 +2219,6 @@ mod tests {
         assert_eq!(dst, wider);
     }
 
-
     // Packed wide storage must keep the historical on-wire representation
     // (`u8` variant tag, then a Varint bit count, then one `LogicBit`
     // discriminant per bit). `-o` compile artifacts and design-cache files
@@ -2231,7 +2239,12 @@ mod tests {
         assert_eq!(bytes[0], 1, "Wide variant tag");
         assert_eq!(bytes[1], 120, "Varint bit count (single byte < 128)");
         for i in 0..120usize {
-            let want = match i { 0 => 1, 5 => 2, 119 => 3, _ => 0 };
+            let want = match i {
+                0 => 1,
+                5 => 2,
+                119 => 3,
+                _ => 0,
+            };
             assert_eq!(bytes[2 + i], want, "bit {} LogicBit code", i);
         }
     }
@@ -2273,7 +2286,10 @@ mod tests {
         assert_eq!(a.range_select(7, 0).to_u64(), Some(0xF0));
         assert_eq!(a.range_select(159, 152).to_u64(), Some(0xF0));
         assert_eq!(a.range_select(95, 64).to_u64(), Some(0xF0F0F0F0));
-        assert_eq!(a.range_select(127, 64), Value::from_u64(0xF0F0F0F0F0F0F0F0, 64));
+        assert_eq!(
+            a.range_select(127, 64),
+            Value::from_u64(0xF0F0F0F0F0F0F0F0, 64)
+        );
         assert_eq!(a.range_select(159, 0), a);
 
         // Resize keeps the low bits; wide→inline at exactly 64.
