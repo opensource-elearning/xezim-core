@@ -14,9 +14,9 @@
 //!
 //! # Usage
 //!
-//! This module is intended to eventually replace `ValueStorage::Wide` in the
-//! `Value` type. For now, it's a separate implementation that can be tested
-//! and benchmarked independently.
+//! This is the storage backing `ValueStorage::Wide` in the `Value` type — it
+//! replaced the former `Vec<LogicBit>`. It can also be benchmarked and tested
+//! independently.
 
 use serde::{Serialize, Deserialize};
 use crate::value::LogicBit;

@@ -1,6 +1,15 @@
 //! Microbenchmark for the Tier1 wide-op fast paths. Run:
 //!   cargo test --release --test tier1_bench -- --ignored --nocapture
 //! Prints ns/op for each op on a 4096-bit value; compare across commits.
+//!
+//! Reference (before → after, same machine, back-to-back; parent of the perf
+//! commit vs the perf commit). Absolute values drift with machine load; the
+//! ratio is the signal:
+//!   has_xz(all-zero)   333 → ~100 ns   (3.3×)
+//!   bitwise_and/xor   27670 → ~3600    (7.7×)
+//!   shift_left/right ~16750/14260 → ~1700/1600  (~9×)
+//!   range_select      5492 → ~157     (35×)
+//!   reduce_or         19.8 → ~11.5    (1.7×)
 use xezim_core::value::Value;
 use std::time::Instant;
 
