@@ -574,7 +574,11 @@ mod scans_and_shifts {
                 bits.iter().any(|b| *b == LogicBit::Zero),
                 "has_known_zero width={width}"
             );
-            assert_eq!(pb.is_zero(), bits.iter().all(|b| *b == LogicBit::Zero), "is_zero width={width}");
+            assert_eq!(
+                pb.is_zero(),
+                bits.iter().all(|b| *b == LogicBit::Zero),
+                "is_zero width={width}"
+            );
         }
     }
 
@@ -588,7 +592,10 @@ mod scans_and_shifts {
             let all_x = PackedBits::new_fill(width, LogicBit::X);
             assert!(all_x.has_xz());
             assert!(!all_x.has_known_one(), "width={width}");
-            assert!(!all_x.has_known_zero(), "padding zero-lanes leaked: width={width}");
+            assert!(
+                !all_x.has_known_zero(),
+                "padding zero-lanes leaked: width={width}"
+            );
             assert!(!all_x.is_zero(), "width={width}");
 
             let all_z = PackedBits::new_fill(width, LogicBit::Z);
@@ -622,7 +629,11 @@ mod scans_and_shifts {
                 let expect_r: Vec<LogicBit> = (0..width as usize)
                     .map(|i| {
                         let s = i + amt as usize;
-                        if s < bits.len() { bits[s] } else { LogicBit::Zero }
+                        if s < bits.len() {
+                            bits[s]
+                        } else {
+                            LogicBit::Zero
+                        }
                     })
                     .collect();
                 assert_eq!(live(&shr), expect_r, "shr width={width} amt={amt}");
@@ -635,7 +646,16 @@ mod scans_and_shifts {
         for width in [0u32, 1, 3, 4, 5, 66, 100, 160] {
             let pb = pattern(width);
             let bits = live(&pb);
-            for (lo, w) in [(0usize, 0u32), (0, 1), (3, 4), (0, 66), (3, 65), (63, 66), (100, 5), (1000, 8)] {
+            for (lo, w) in [
+                (0usize, 0u32),
+                (0, 1),
+                (3, 4),
+                (0, 66),
+                (3, 65),
+                (63, 66),
+                (100, 5),
+                (1000, 8),
+            ] {
                 let ex = pb.extract(lo, w);
                 let expect: Vec<LogicBit> = (0..w as usize)
                     .map(|i| bits.get(lo + i).copied().unwrap_or(LogicBit::Zero))

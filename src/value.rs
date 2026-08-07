@@ -1788,9 +1788,13 @@ impl Value {
             ValueStorage::Wide(bits) => {
                 // Word-level scans with early exit (PackedBits::has_known_one /
                 // has_xz) instead of two per-bit iterator passes.
-                if bits.has_known_one() { Some(true) }
-                else if bits.has_xz() { None }
-                else { Some(false) }
+                if bits.has_known_one() {
+                    Some(true)
+                } else if bits.has_xz() {
+                    None
+                } else {
+                    Some(false)
+                }
             }
         }
     }
@@ -1812,9 +1816,13 @@ impl Value {
                 else { Value::from_u64(1, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.has_known_zero() { Value::from_u64(0, 1) }
-                else if bits.has_xz() { Value::new(1) }
-                else { Value::from_u64(1, 1) }
+                if bits.has_known_zero() {
+                    Value::from_u64(0, 1)
+                } else if bits.has_xz() {
+                    Value::new(1)
+                } else {
+                    Value::from_u64(1, 1)
+                }
             }
         }
     }
@@ -1829,9 +1837,13 @@ impl Value {
                 else { Value::from_u64(0, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.has_known_one() { Value::from_u64(1, 1) }
-                else if bits.has_xz() { Value::new(1) }
-                else { Value::from_u64(0, 1) }
+                if bits.has_known_one() {
+                    Value::from_u64(1, 1)
+                } else if bits.has_xz() {
+                    Value::new(1)
+                } else {
+                    Value::from_u64(0, 1)
+                }
             }
         }
     }
@@ -2448,13 +2460,36 @@ mod tests {
         let wide = Value::from_str_radix(&"f0xz".repeat(20), 16, 160);
         let small = Value::from_u64(0x5A, 8);
         let narrow = Value::from_str_radix(&"xz10".repeat(17), 2, 66);
-        for (a, b) in [(&wide, &small), (&wide, &narrow), (&narrow, &small), (&narrow, &wide)] {
+        for (a, b) in [
+            (&wide, &small),
+            (&wide, &narrow),
+            (&narrow, &small),
+            (&narrow, &wide),
+        ] {
             for (name, f, op) in [
-                ("and", Value::bitwise_and as fn(&Value, &Value) -> Value, and_op as fn(LogicBit, LogicBit) -> LogicBit),
-                ("or", Value::bitwise_or as fn(&Value, &Value) -> Value, or_op as fn(LogicBit, LogicBit) -> LogicBit),
-                ("xor", Value::bitwise_xor as fn(&Value, &Value) -> Value, xor_op as fn(LogicBit, LogicBit) -> LogicBit),
+                (
+                    "and",
+                    Value::bitwise_and as fn(&Value, &Value) -> Value,
+                    and_op as fn(LogicBit, LogicBit) -> LogicBit,
+                ),
+                (
+                    "or",
+                    Value::bitwise_or as fn(&Value, &Value) -> Value,
+                    or_op as fn(LogicBit, LogicBit) -> LogicBit,
+                ),
+                (
+                    "xor",
+                    Value::bitwise_xor as fn(&Value, &Value) -> Value,
+                    xor_op as fn(LogicBit, LogicBit) -> LogicBit,
+                ),
             ] {
-                assert_eq!(f(a, b), per_bit_op(a, b, op), "{name} width {} vs {}", a.width, b.width);
+                assert_eq!(
+                    f(a, b),
+                    per_bit_op(a, b, op),
+                    "{name} width {} vs {}",
+                    a.width,
+                    b.width
+                );
             }
         }
     }
@@ -2485,14 +2520,25 @@ mod tests {
                 for i in 0..w {
                     ref_v.set_bit(i, v.get_bit(lo + i));
                 }
-                assert_eq!(v.range_select(hi, lo), ref_v, "range lo={} hi={} width={}", lo, hi, v.width);
+                assert_eq!(
+                    v.range_select(hi, lo),
+                    ref_v,
+                    "range lo={} hi={} width={}",
+                    lo,
+                    hi,
+                    v.width
+                );
             }
             // Partial overhang: bits past the source read x (§11.5.1).
             let (lo, hi) = (60usize, 70usize);
-            if lo + hi - lo + 1 > wsrc {
+            if hi + 1 > wsrc {
                 let got = v.range_select(hi, lo);
                 for i in 0..(hi - lo + 1) {
-                    let want = if lo + i < wsrc { v.get_bit(lo + i) } else { LogicBit::X };
+                    let want = if lo + i < wsrc {
+                        v.get_bit(lo + i)
+                    } else {
+                        LogicBit::X
+                    };
                     assert_eq!(got.get_bit(i), want, "overhang lo={lo} hi={hi} bit {i}");
                 }
             }
@@ -2523,7 +2569,9 @@ mod tests {
                     (LogicBit::One, LogicBit::One) => LogicBit::One,
                     _ => LogicBit::X,
                 }
-            } else { LogicBit::Zero };
+            } else {
+                LogicBit::Zero
+            };
             assert_eq!(got.get_bit(i), want, "and bit {i}");
         }
     }
