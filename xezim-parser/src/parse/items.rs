@@ -1901,6 +1901,7 @@ impl Parser {
                 ClassItem::Constraint(ClassConstraint {
                     is_static: qualifiers.contains(&ClassQualifier::Static),
                     is_extern: qualifiers.contains(&ClassQualifier::Extern),
+                    is_pure: qualifiers.contains(&ClassQualifier::Pure),
                     has_body,
                     name: cname,
                     items,

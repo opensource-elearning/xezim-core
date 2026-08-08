@@ -891,6 +891,10 @@ pub struct ClassConstraint {
     pub is_static: bool,
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_extern: bool,
+    /// IEEE 1800-2017 §18.5.2: `pure constraint` — an abstract-class
+    /// prototype that every non-abstract derived class must implement.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_pure: bool,
     #[cfg_attr(feature = "serde", serde(default))]
     pub has_body: bool,
     pub name: Identifier,
