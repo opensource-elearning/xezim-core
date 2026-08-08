@@ -32,7 +32,9 @@ impl Parser {
 
         ModuleDeclaration {
             attrs: Vec::new(),
-            kind, lifetime, name, params, ports, items, endlabel,
+            kind, lifetime, name, params, ports, items,
+            specparams: std::mem::take(&mut self.specparams),
+            endlabel,
             span: self.span_from(start),
         }
     }
@@ -60,7 +62,9 @@ impl Parser {
 
         InterfaceDeclaration {
             attrs: Vec::new(),
-            lifetime, name, params, ports, items, endlabel,
+            lifetime, name, params, ports, items,
+            specparams: std::mem::take(&mut self.specparams),
+            endlabel,
             span: self.span_from(start),
         }
     }
@@ -88,7 +92,9 @@ impl Parser {
 
         ProgramDeclaration {
             attrs: Vec::new(),
-            lifetime, name, params, ports, items, endlabel,
+            lifetime, name, params, ports, items,
+            specparams: std::mem::take(&mut self.specparams),
+            endlabel,
             span: self.span_from(start),
         }
     }
@@ -417,9 +423,20 @@ impl Parser {
                 self.parse_module_item()
             }
             // §6.20.5 specparam — parse-accept (xezim doesn't model specify
-            // timing); consume through the terminating ';'.
+            // timing); consume through the terminating ';'. The declared NAMES
+            // are kept (`self.specparams`) so the second-pass lint can reject
+            // a specparam referenced in a parameter value expression, which
+            // the LRM forbids ("can appear in any expression that is not
+            // assigned to a parameter"). A name is an identifier immediately
+            // followed by `=` — range bounds (`[lo:hi]`) and constant-expr
+            // identifiers are never followed by `=`, so this is unambiguous.
             TokenKind::KwSpecparam => {
-                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                    if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Assign {
+                        self.specparams.push(self.current().text.clone());
+                    }
+                    self.bump();
+                }
                 self.expect(TokenKind::Semicolon);
                 None
             }

@@ -20,6 +20,12 @@ pub struct ModuleDeclaration {
     pub params: Vec<ParameterDeclaration>,
     pub ports: PortList,
     pub items: Vec<ModuleItem>,
+    /// IEEE 1800-2017 §6.20.5: specparam declarations at module scope. xezim
+    /// does not model specify timing, so each specparam is captured by NAME
+    /// only — enough to enforce the LRM restriction that a specparam "can
+    /// appear in any expression that is not assigned to a parameter".
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub specparams: Vec<String>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }
@@ -33,6 +39,9 @@ pub struct InterfaceDeclaration {
     pub params: Vec<ParameterDeclaration>,
     pub ports: PortList,
     pub items: Vec<ModuleItem>,
+    /// IEEE 1800-2017 §6.20.5: specparam names declared in an interface body.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub specparams: Vec<String>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }
@@ -46,6 +55,9 @@ pub struct ProgramDeclaration {
     pub params: Vec<ParameterDeclaration>,
     pub ports: PortList,
     pub items: Vec<ModuleItem>,
+    /// IEEE 1800-2017 §6.20.5: specparam names declared in a program body.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub specparams: Vec<String>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }

@@ -597,6 +597,17 @@ impl SourceDefinition {
             | SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => &[],
         }
     }
+
+    /// IEEE 1800-2017 §6.20.5: specparam names declared in this definition's
+    /// body (modules / interfaces / programs only; empty elsewhere).
+    pub fn specparams(&self) -> &[String] {
+        match self {
+            SourceDefinition::Module(m) => &m.specparams,
+            SourceDefinition::Interface(i) => &i.specparams,
+            SourceDefinition::Program(p) => &p.specparams,
+            _ => &[],
+        }
+    }
 }
 
 /// Tokenize a source string.
@@ -1044,6 +1055,7 @@ fn parse_and_elaborate(
                     params: Vec::new(),
                     ports: c.ports,
                     items: c.items,
+                    specparams: Vec::new(),
                     endlabel: c.endlabel,
                     span: c.span,
                 };
@@ -1755,6 +1767,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         params: vec![],
         ports: ast::module::PortList::Empty,
         items,
+        specparams: vec![],
         endlabel: None,
         span: ast::Span::dummy(),
     }

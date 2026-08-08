@@ -36,6 +36,12 @@ pub struct Parser {
     /// `parse_constraint_item` once the enclosing expression finishes.
     pub(super) pending_paren_dist:
         Vec<(Vec<crate::ast::decl::ConstraintRange>, Vec<Option<crate::ast::decl::DistWeight>>)>,
+    /// IEEE 1800-2017 §6.20.5: specparam names collected while parsing module
+    /// / interface / program items. xezim doesn't model specify timing, so the
+    /// declaration is parse-accept; the NAMES are kept so the second-pass lint
+    /// can enforce that a specparam is never referenced in a parameter value
+    /// expression. Drained by the enclosing decl constructor.
+    pub(super) specparams: Vec<String>,
 }
 
 impl Parser {
@@ -44,7 +50,8 @@ impl Parser {
                pending_pattern_bindings: Vec::new(),
                in_sva_seq: false,
                in_constraint: false,
-               pending_paren_dist: Vec::new() }
+               pending_paren_dist: Vec::new(),
+               specparams: Vec::new() }
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] { &self.diagnostics }
@@ -455,6 +462,7 @@ impl Parser {
                 params: Vec::new(),
                 ports: crate::ast::module::PortList::NonAnsi(ports),
                 items: Vec::new(),
+                specparams: Vec::new(),
                 endlabel: None,
                 span,
             })
