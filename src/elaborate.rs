@@ -9714,7 +9714,7 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                     ExprKind::Ident(hier) => {
                         let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                         // First try parameter ident → its Value width.
-                        params?.get(name).map(|v| v.width as i64)
+                        params.and_then(|p| p.get(name)).map(|v| v.width as i64)
                             // Then fall through to the thread-local typedef
                             // table (set by callers that have one available).
                             .or_else(|| TYPEDEFS_TLS.with(|td| {
@@ -9722,6 +9722,13 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                     .and_then(|m| m.get(name).copied())
                                     .map(|w| w as i64)
                             }))
+                            // §20.6.2 over a BUILT-IN integer atom type.
+                            // `$bits(int)` parses to a bare Ident (the operand
+                            // is not a typedef and not a parameter), so both
+                            // lookups above miss and the call answered 0 — a
+                            // `localparam W = $bits(int)` used as a vector
+                            // width then declared a degenerate vector.
+                            .or_else(|| atom_keyword_width(name).map(|w| w as i64))
                     }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
@@ -9817,6 +9824,54 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                             }
                         }
                         expr_bits(inner, params)
+                    }
+                    // §20.6.2 `$bits(<data_type>)`. `logic [0:0][1:0][1:0]`
+                    // parses to a TypeLiteral (a data-type KEYWORD starts it),
+                    // but nothing evaluated that node, so the whole call fell
+                    // through to None and the enclosing localparam became 0 —
+                    // `logic [VLD_W-1:0]` then declared a degenerate vector and
+                    // half the bits silently vanished.
+                    ExprKind::TypeLiteral(dt) => {
+                        let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
+                        Some(resolve_type_width(dt, params, td.as_ref()) as i64)
+                    }
+                    // §20.6.2 over a TYPEDEF with packed dimensions —
+                    // `$bits(pkg::t [0:0][1:0])`. A scoped type name is not a
+                    // data-type keyword, so the parser cannot take the
+                    // TypeLiteral path and produces a RangeSelect chain over a
+                    // MemberAccess instead. Evaluated as an expression that is
+                    // a 2-bit part-select; it is really the typedef's width
+                    // times every dimension. Getting 2 instead of 292 truncated
+                    // a flattened pipeline stage to two bits.
+                    ExprKind::RangeSelect { .. } => {
+                        let mut dims: Vec<(i64, i64)> = Vec::new();
+                        let mut cur: &Expression = inner;
+                        while let ExprKind::RangeSelect { expr, kind, left, right } = &cur.kind {
+                            if !matches!(kind, crate::ast::expr::RangeKind::Constant) {
+                                return None;
+                            }
+                            let l = const_eval_i64_with_params(left, params)?;
+                            let r = const_eval_i64_with_params(right, params)?;
+                            dims.push((l, r));
+                            cur = expr.as_ref();
+                        }
+                        // The base must name a TYPE, not a signal — a signal
+                        // part-select keeps its existing meaning.
+                        let tname = match &cur.kind {
+                            ExprKind::MemberAccess { member, .. } => member.name.clone(),
+                            ExprKind::Ident(h) => {
+                                h.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+                            }
+                            _ => return None,
+                        };
+                        let base_w = TYPEDEFS_TLS.with(|td| {
+                            td.borrow().as_ref().and_then(|m| m.get(&tname).copied())
+                        })? as i64;
+                        let mut total = base_w;
+                        for (l, r) in dims {
+                            total = total.checked_mul((l - r).abs() + 1)?;
+                        }
+                        Some(total)
                     }
                     _ => None,
                 }
@@ -10368,6 +10423,53 @@ fn bits_of_signal_expr(
             );
         }
         return None;
+    }
+    // §20.6.2 `$bits(<typedef> [dims])` — `$bits(pkg::t [0:0][1:0])`. A scoped
+    // or plain TYPE NAME is not a data-type keyword, so the parser cannot emit
+    // a TypeLiteral and produces a RangeSelect chain over the type name
+    // instead. It looks exactly like a part-select, and the arm below sized it
+    // by its own bounds: `$bits(t [0:0][1:0])` came back 2 rather than
+    // `$bits(t) * 1 * 2`. A flattened pipeline stage declared
+    // `logic [DATA_BITS-1:0]` then held two bits instead of 292 and dropped
+    // every payload. Must be tried BEFORE the part-select arm, and only when
+    // the base names a type that is NOT also a signal — a real part-select of
+    // a signal keeps its ordinary meaning.
+    {
+        let mut dims: Vec<(i64, i64)> = Vec::new();
+        let mut cur: &Expression = arg;
+        while let ExprKind::RangeSelect { kind, left, right, expr } = &cur.kind {
+            if !matches!(kind, RangeKind::Constant) {
+                break;
+            }
+            let (Some(l), Some(r)) = (
+                const_eval_i64_with_params(left, Some(params)),
+                const_eval_i64_with_params(right, Some(params)),
+            ) else {
+                break;
+            };
+            dims.push((l, r));
+            cur = expr.as_ref();
+        }
+        if !dims.is_empty() {
+            let tname = match &cur.kind {
+                // `pkg::t` lowers to the same MemberAccess node as a struct
+                // member select.
+                ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                ExprKind::Ident(h) => h.path.last().map(|sg| sg.name.name.clone()),
+                _ => None,
+            };
+            if let Some(tname) = tname {
+                let is_signal = signals.contains_key(&tname)
+                    || signals.contains_key(&format!("{}{}", prefix, tname));
+                if !is_signal && let Some(&base_w) = typedefs.get(&tname) {
+                    let mut total = base_w as i64;
+                    for (l, r) in dims {
+                        total = total.checked_mul((l - r).abs() + 1)?;
+                    }
+                    return u32::try_from(total).ok().filter(|w| *w > 0);
+                }
+            }
+        }
     }
     // A part-select is sized by its own bounds, whatever the base is.
     if let ExprKind::RangeSelect { kind, left, right, .. } = &arg.kind {
@@ -12068,6 +12170,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     params.get(n).map(|v| v.width)
                         .or_else(|| TYPEDEFS_TLS.with(|td|
                             td.borrow().as_ref().and_then(|m| m.get(n).copied())))
+                        // §20.6.2 over a BUILT-IN integer atom type — see the
+                        // matching arm in `const_eval_i64_with_params`.
+                        .or_else(|| atom_keyword_width(n))
                         .unwrap_or(0)
                 }
                 // §26.3 package-/class-scoped type — see the matching arm in
@@ -12100,6 +12205,65 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
                 ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
                 ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
+                // §20.6.2 `$bits(<data_type>)`. `logic [0:0][1:0][1:0]` parses
+                // to a TypeLiteral, which no arm evaluated, so the `_ => 0`
+                // default made the enclosing localparam 0 — and
+                // `logic [W-1:0]` then declared a degenerate vector.
+                ExprKind::TypeLiteral(dt) => {
+                    let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
+                    resolve_type_width(dt, Some(params), td.as_ref())
+                }
+                // §20.6.2 over a TYPEDEF carrying packed dimensions —
+                // `$bits(pkg::t [0:0][1:0])`. A scoped type name is not a
+                // data-type keyword, so the parser cannot produce a
+                // TypeLiteral and emits a RangeSelect chain over the
+                // MemberAccess instead; evaluated as an expression that is a
+                // 2-bit part-select. It is really the typedef's width times
+                // every dimension — 2 instead of 292 truncated a flattened
+                // pipeline stage to two bits.
+                ExprKind::RangeSelect { .. } => {
+                    let mut dims: Vec<(i64, i64)> = Vec::new();
+                    let mut cur: &Expression = inner;
+                    let mut ok = true;
+                    while let ExprKind::RangeSelect { expr, kind, left, right } = &cur.kind {
+                        if !matches!(kind, crate::ast::expr::RangeKind::Constant) {
+                            ok = false;
+                            break;
+                        }
+                        match (
+                            const_eval_i64_with_params(left, Some(params)),
+                            const_eval_i64_with_params(right, Some(params)),
+                        ) {
+                            (Some(l), Some(r)) => dims.push((l, r)),
+                            _ => { ok = false; break; }
+                        }
+                        cur = expr.as_ref();
+                    }
+                    // The base must name a TYPE — a signal part-select keeps
+                    // its ordinary meaning and is left to the arms above.
+                    let tname = match &cur.kind {
+                        ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                        ExprKind::Ident(h) => {
+                            h.path.last().map(|sg| sg.name.name.clone())
+                        }
+                        _ => None,
+                    };
+                    let base_w = tname.filter(|_| ok).and_then(|n| {
+                        TYPEDEFS_TLS.with(|td| {
+                            td.borrow().as_ref().and_then(|m| m.get(&n).copied())
+                        })
+                    });
+                    match base_w {
+                        Some(bw) => {
+                            let mut total = bw as i64;
+                            for (l, r) in dims {
+                                total = total.saturating_mul((l - r).abs() + 1);
+                            }
+                            total as u32
+                        }
+                        None => 0,
+                    }
+                }
                 _ => 0,
             };
             Value::from_u64(w as u64, 32)
